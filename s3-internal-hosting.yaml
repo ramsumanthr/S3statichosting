@@ -1,0 +1,271 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  Version:
+    Type: String
+    Default: ""
+  VPCStackName: # CloudFormation stack name of VPC Stack, for importing SubnetID's, VPCE & SecurityGP ID.
+    Type: String
+    Description: VPC stack name from CloudFormation
+    Default: ""
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name
+    Default: ""
+  CertificateArn:
+    Type: String
+    Description: ARN of the SSL certificate for HTTPS
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref S3BucketName
+
+  S3InterfaceEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId:
+        Fn::ImportValue: !Sub "${VPCStackName}-VPC"
+      ServiceName: !Join [ "", [ "com.amazonaws.", { "Ref": "AWS::Region" }, ".s3" ] ]
+      VpcEndpointType: "Interface"
+      PrivateDnsEnabled: true  
+      SubnetIds:
+        - Fn::ImportValue: !Sub "${VPCStackName}-SubnetAPrivate"
+        - Fn::ImportValue: !Sub "${VPCStackName}-SubnetBPrivate"
+        - Fn::ImportValue: !Sub "${VPCStackName}-SubnetCPrivate"
+      SecurityGroupIds:
+        - Fn::ImportValue: !Sub "${VPCStackName}-SecurityGroup"
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Id: "Policy1415115909152"
+        Statement:
+          - Sid: "Access-to-specific-VPCE-only"
+            Effect: "Allow"
+            Principal: "*"
+            Action: 
+              - "s3:GetObject*"
+              - "s3:PutObject*"
+              - "s3:ListBucket"
+            Resource:
+              - !Sub "arn:aws:s3:::${S3Bucket}"
+              - !Sub "arn:aws:s3:::${S3Bucket}/*"
+            Condition:
+              StringEquals:
+                "aws:SourceVpce": !Sub "${VPCStackName}-VPC"
+          - Sid: "Access-to-Cross Account SSO User"
+            Effect: "Allow"
+            Principal:
+              AWS: "arn:aws:iam::704361141778:root"
+            Action: 
+              - "s3:GetObject*"
+              - "s3:PutObject*"
+              - "s3:ListBucket"
+              - "s3:DeleteObject*"
+            Resource:
+              - !Sub "arn:aws:s3:::${S3Bucket}"
+              - !Sub "arn:aws:s3:::${S3Bucket}/*"
+            Condition:
+              StringEquals:
+                "aws:SourceVpce": !Sub "${VPCStackName}-VPC"  
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  LambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:*
+              - logs:*
+            Resource: '*'
+      Roles:
+        - !Ref LambdaRole
+
+  LambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    DeletionPolicy: 'Delete'
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import cfnresponse
+          import json
+          import boto3
+          def lambda_handler(event, context):
+              print('REQUEST RECEIVED:\n' + json.dumps(event))
+              responseData = {}
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                return
+              if event['RequestType'] == 'Create':
+                try:
+                  ec2 = boto3.resource('ec2')
+                  enis = event['ResourceProperties']['NetworkInterfaceIds']
+                  for index, eni in enumerate(enis):
+                    network_interface = ec2.NetworkInterface(eni)
+                    responseData['IP' + str(index)] = network_interface.private_ip_address
+                    print(responseData)
+                except Exception as e:
+                  responseData = {'error': str(e)}
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData)
+                  return
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData)
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 10
+
+  GetPrivateIPs:
+    Type: Custom::GetPrivateIPs
+    Properties:
+      ServiceToken: !GetAtt LambdaFunction.Arn
+      NetworkInterfaceIds: !GetAtt S3InterfaceEndpoint.NetworkInterfaceIds
+
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Sub ${AWS::StackName}-alb
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 80
+          ToPort: 80
+        - CidrIp: "0.0.0.0/0"
+          IpProtocol: "TCP"
+          FromPort: 443
+          ToPort: 443
+      VpcId:
+        Fn::ImportValue: !Sub "${VPCStackName}-VPC"
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - Fn::ImportValue: !Sub "${VPCStackName}-SubnetAPrivate"
+        - Fn::ImportValue: !Sub "${VPCStackName}-SubnetBPrivate"
+        - Fn::ImportValue: !Sub "${VPCStackName}-SubnetCPrivate"
+      SecurityGroups:
+        - !Ref SecurityGroup
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: LoadBalancer
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckPort: '80'
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200,307,405'
+      VpcId:
+        Fn::ImportValue: !Sub "${VPCStackName}-VPC"
+      Port: 443
+      Protocol: HTTPS
+      TargetType: ip 
+      Targets:
+        - Id: !GetAtt GetPrivateIPs.IP0
+        - Id: !GetAtt GetPrivateIPs.IP1
+        - Id: !GetAtt GetPrivateIPs.IP2
+  TargetGroupListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - Ref S3bucket
+      ListenerArn: !Ref ALBListenerHTTPS
+      Priority: 1
+  RedirectTrailingSlashListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - RedirectConfig:
+            Host: '#{host}'
+            Path: '/#{path}index.html'
+            Port: '#{port}'
+            Protocol: '#{protocol}'
+            Query: '#{query}'
+            StatusCode: HTTP_301
+          Type: redirect
+      Conditions:
+        - Field: path-pattern
+          HostHeaderConfig:
+            Values:
+              - "*/"
+        - Field: host-header
+          Values:
+            - Ref S3Bucket
+      ListenerArn: !Ref ALBListenerHTTPS
+      Priority: 2
+  
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            StatusCode: HTTP_301
+            Protocol: HTTPS
+            Port: '443'
+            Host: '#{host}'
+            
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: 200
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: '443'
+      Protocol: HTTPS
+
+Outputs:
+  StackName:
+    Description: 'Stack name.'
+    Value: !Sub '${AWS::StackName}'
+  VpcS3Interface:
+    Description: 'VPCE ID S3 Interface Endpoint'
+    Value: !Ref S3InterfaceEndpoint
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCEndpointS3Interface'
+  TargetGroup:
+    Value: !Ref TargetGroup
+  ServiceUrl:
+    Description: URL of the load balancer for the sample service.
+    Value: !Sub http://${LoadBalancer.DNSName}
+  SecurityGroup:
+    Value: !Ref SecurityGroup
